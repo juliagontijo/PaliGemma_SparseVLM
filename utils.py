@@ -6,6 +6,13 @@ from safetensors import safe_open
 from typing import Tuple
 import os
 
+import torch
+import torch.nn as nn
+
+# def get_model_classes():
+#     from .modeling_gemma import PaliGemmaForConditionalGeneration, PaliGemmaConfig
+#     return PaliGemmaForConditionalGeneration, PaliGemmaConfig
+
 def load_hf_model(model_path: str, device: str) -> Tuple[PaliGemmaForConditionalGeneration, AutoTokenizer]:
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
@@ -36,3 +43,4 @@ def load_hf_model(model_path: str, device: str) -> Tuple[PaliGemmaForConditional
     model.tie_weights()
 
     return (model, tokenizer)
+

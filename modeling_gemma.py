@@ -5,6 +5,12 @@ from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 
+# from utils import *
+from score import *
+import math
+import einops as ein
+
+
 class KVCache():
 
     def __init__(self) -> None:
@@ -36,6 +42,159 @@ class KVCache():
 
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+def  batch_index_select(x, idx):
+
+    if len(x.size()) == 4:
+        B, H, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, H, C)[idx.reshape(-1)].reshape(B, H, N_new, C)
+        return out
+    elif len(x.size()) == 3:
+        # in this condition
+        B, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
+        return out
+    elif len(x.size()) == 2:
+        B, N = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N)[idx.reshape(-1)].reshape(B, N_new)
+        return out
+    else:
+        raise NotImplementedError
+    
+
+def index_points(points, idx):
+    """Sample features following the index.
+    Returns:
+        new_points:, indexed points data, [B, S, C]
+
+    Args:
+        points: input points data, [B, N, C]
+        idx: sample index data, [B, S]
+    """
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
+
+
+def cluster_and_merge(x, cluster_num):
+    
+    B, N, C = x.shape
+
+    x1 = ein.rearrange(x, "b l r -> b l () r")
+    x2 = ein.rearrange(x, "b l r -> b () l r")
+    distance = (x1 - x2).norm(dim=-1, p=2)
+    dist_matrix = distance / (C ** 0.5)        
+    # get local density
+    dist_nearest, index_nearest = torch.topk(dist_matrix, k=cluster_num, dim=-1, largest=False)
+    density = (-(dist_nearest ** 2).mean(dim=-1)).exp()
+    # add a little noise to ensure no tokens have the same density.
+    density = density + torch.rand(
+        density.shape, device=density.device, dtype=density.dtype) * 1e-6
+
+    # get distance indicator
+    mask = density[:, None, :] > density[:, :, None]
+    mask = mask.type(x.dtype)
+    dist_max = dist_matrix.flatten(1).max(dim=-1)[0][:, None, None]
+    dist, index_parent = (dist_matrix * mask + dist_max * (1 - mask)).min(dim=-1)
+
+    # select clustering center according to score
+    score = dist * density
+    _, index_down = torch.topk(score, k=cluster_num, dim=-1)        
+
+    # assign tokens to the nearest center
+    dist_matrix = index_points(dist_matrix, index_down)     
+
+    idx_cluster = dist_matrix.argmin(dim=1)    
+
+    # make sure cluster center merge to itself 
+    idx_batch = torch.arange(B, device=x.device)[:, None].expand(B, cluster_num)
+    idx_tmp = torch.arange(cluster_num, device=x.device)[None, :].expand(B, cluster_num)
+    idx_cluster[idx_batch.reshape(-1), index_down.reshape(-1)] = idx_tmp.reshape(-1)
+
+    # merge tokens
+
+    B, N, C = x.shape
+    device = dist_matrix.device
+    idx_token = torch.arange(N)[None, :].repeat(B, 1).to(device)
+    agg_weight = x.new_ones(B, N, 1)
+    
+    token_weight = x.new_ones(B, N, 1)
+    # self_attn_weights = self_attn_weights.mean(1)
+    # token_weight = self_attn_weights.sum(dim=1).exp().unsqueeze(2) 
+    # B_weight,N_weigh,C_weight = token_weight.shape
+    # token_weight = token_weight.reshape(B_weight*N_weigh, C_weight)[sparse_token_idx.reshape(-1)].reshape(B, N, 1)
+    
+    idx_batch = torch.arange(B, device=x.device)[:, None]
+    idx = idx_cluster + idx_batch * cluster_num     
+
+    all_weight = token_weight.new_zeros(B * cluster_num, 1)
+    all_weight.index_add_(dim=0, index=idx.reshape(B * N),      
+                            source=token_weight.reshape(B * N, 1))      
+    all_weight = all_weight + 1e-6
+    norm_weight = token_weight / all_weight[idx]       
+
+    # average token features
+    x_merged = x.new_zeros(B * cluster_num, C)
+    source = x * norm_weight
+    x_merged.index_add_(dim=0, index=idx.reshape(B * N),        
+                        source=source.reshape(B * N, C).type(x.dtype))
+    x_merged = x_merged.reshape(B, cluster_num, C)
+    
+    return x_merged
+
+
+def softmax_with_policy(attn, policy, eps=1e-6):    # attn : [2, 687, 32, 32] policy : [2, 687, 1]
+    B, N, _ = policy.size()
+    B, H, T, N = attn.size()
+    if T == 1:
+        # attn_policy = policy.reshape(B, 1, 1, N)
+        # max_att = torch.max(attn, dim=-1, keepdim=True)[0]  # [2, 32, 687, 1]
+        # attn = attn - max_att
+        # attn = attn.to(torch.float32).exp_() * attn_policy.to(torch.float32)  # [2, 32, 687, 687]
+        # attn = (attn + eps/N) / (attn.sum(dim=-1, keepdim=True) + eps)      # [2, 32, 687, 687]
+        policy_bias = torch.zeros(B, 1, N, 1, dtype=policy.dtype).to(device=policy.device)
+        policy_bias.masked_fill_(policy.logical_not(), float("-inf"))
+        policy_bias = policy_bias.permute(0, 1, 3, 2).to(policy.dtype)
+        attn += policy_bias.to(device=attn.device)
+        attn = torch.softmax(attn, dim=-1)
+        return attn
+    else:
+        # attn_policy = policy.reshape(B, 1, 1, N)  # * policy.reshape(B, 1, N, 1)    [2, 1, 1, 687]
+        # eye = torch.eye(N, dtype=attn_policy.dtype, device=attn_policy.device).view(1, 1, N, N) # [1, 1, 687, 687]
+        # attn_policy = attn_policy + (1.0 - attn_policy) * eye   # [2, 1, 687, 687]
+        # max_att = torch.max(attn, dim=-1, keepdim=True)[0]  # [2, 32, 687, 1]
+        # attn = attn - max_att   # 
+        # # attn = attn.exp_() * attn_policy
+        # # return attn / attn.sum(dim=-1, keepdim=True)
+
+        # # for stable training
+        # attn = attn.to(torch.float32).exp_() * attn_policy.to(torch.float32)  # [2, 32, 687, 687]
+        # attn = (attn + eps/N) / (attn.sum(dim=-1, keepdim=True) + eps)      # [2, 32, 687, 687]
+        attn_policy = policy.reshape(B, 1, 1, N)  # * policy.reshape(B, 1, N, 1)    [2, 1, 1, 687]
+        eye = torch.eye(N, dtype=attn_policy.dtype, device=attn_policy.device).view(1, 1, N, N) # [1, 1, 687, 687]
+        attn_policy = attn_policy + (1.0 - attn_policy) * eye   # [2, 1, 687, 687]
+        policy_bias = torch.zeros(B, 1, N, N, dtype=attn_policy.dtype).to(device=attn_policy.device)
+        policy_bias.masked_fill_(attn_policy.logical_not(), float("-inf"))
+        policy_bias.to(attn_policy.dtype)
+        attn += policy_bias
+        attn = torch.softmax(attn, dim=-1)
+        return attn
+
 
 class GemmaConfig():
 
@@ -230,6 +389,7 @@ class GemmaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        policy = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         kv_cache: Optional[KVCache] = None,
@@ -260,6 +420,8 @@ class GemmaAttention(nn.Module):
         # Repeat the key and values to match the number of heads of the query
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # if policy is None:
         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -269,6 +431,7 @@ class GemmaAttention(nn.Module):
         # Apply the softmax
         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_logits = attn_weights
         # Apply the dropout
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
@@ -279,6 +442,12 @@ class GemmaAttention(nn.Module):
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
+            
+        # else:
+        #     attn = (query_states @ key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        #     attn = softmax_with_policy(attn, policy)
+        #     attn_output = (attn @ value_states)
+
         # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
         # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
@@ -286,7 +455,7 @@ class GemmaAttention(nn.Module):
         # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, kv_cache, attn_logits
 
 class GemmaDecoderLayer(nn.Module):
 
@@ -303,6 +472,7 @@ class GemmaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        policy = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         kv_cache: Optional[KVCache] = None,
@@ -312,8 +482,9 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states, _, = self.self_attn(
+        hidden_states, self_attn_weights, kv_cache, attn_logits = self.self_attn(
             hidden_states=hidden_states,
+            policy = policy,
             attention_mask=attention_mask,
             position_ids=position_ids,
             kv_cache=kv_cache,
@@ -330,11 +501,18 @@ class GemmaDecoderLayer(nn.Module):
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        outputs = (hidden_states,)
+
+        outputs += (self_attn_weights,)
+
+        outputs += (kv_cache,)
+        attn_logits = None
+        outputs += (attn_logits, )  
+        return outputs
 
 class GemmaModel(nn.Module):
 
-    def __init__(self, config: GemmaConfig):
+    def __init__(self, config: GemmaConfig, pruning_loc=[2, 6, 15]):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -346,6 +524,12 @@ class GemmaModel(nn.Module):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # SPARSE
+        self.pruning_loc = pruning_loc
+
+        self.init_token_total_shape = 664
+        self.generate_process_count = 0
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -356,6 +540,9 @@ class GemmaModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        image_shape=224,
+        pre_prompt_length_list=[],
+        retained_tokens=56,
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
@@ -363,17 +550,151 @@ class GemmaModel(nn.Module):
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
-        for decoder_layer in self.layers:
-            # [Batch_Size, Seq_Len, Hidden_Size]
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                kv_cache=kv_cache,
-            )
+
+        # ------------------------------------------- Sparse--------------------------------------------
+        B, L, _ = hidden_states.shape
+        idx_sprase_layer = 0
+        out_pred_prob = None
+        init_n = self.init_token_total_shape + self.generate_process_count    # 668
+        prev_decision = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+        policy = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+
+        v_token_start = pre_prompt_length_list[0] if len(pre_prompt_length_list) != 0 else 0 # 35
+        text_token_start = v_token_start + image_shape # 611
+        v_token_num = image_shape
+
+
+        if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):
+            v_t = hidden_states[:, v_token_start: text_token_start, :]
+            t_t = hidden_states[:, text_token_start: , :]
+            m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
+            m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
+            t_token_idx = torch.where(m_v_t > m_v_t.mean())
+
+            # num_token = []
+
+        # num_token = []
+
+
+        # TIME
+        # if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):
+        #     total_start_event = torch.cuda.Event(enable_timing=True)
+        #     total_end_event = torch.cuda.Event(enable_timing=True)
+        #     torch.cuda.synchronize()
+        #     total_start_event.record()
+
+
+
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            # if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):       
+            #     n = hidden_states.shape[1]                                  # token num
+            #     d = hidden_states.shape[2]                                  # hidden state size 
+            #     m = self.layers[layer_idx].mlp.up_proj.out_features         # intermediate size of the FFN
+            #     self.all_FLOPs += 4 * n * (d**2) + 2 *(n**2) * d + 3*n*d*m 
+            # Sparse Layers
+            if layer_idx in self.pruning_loc and len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1:
+                
+                # ASSUME WE DO INFERENCE ONLY
+                # [Batch_Size, Seq_Len, Hidden_Size]
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    policy = None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                )
+
+                attn_logits = layer_outputs[2]
+                    
+                pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, text_token_start, t_token_idx, layer_idx,retained_tokens) # B, L_v
+                policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+                policy[:, v_token_start:text_token_start] = pred_score_vis.type(dtype = hidden_states.dtype)
+
+                for batch in range(len(pre_prompt_length_list)):
+                    # keep pre prompt     
+                    prompt_length = pre_prompt_length_list[batch]
+                    policy[batch,:prompt_length,] = 1
+                    # keep question
+                    text_token_start = prompt_length + image_shape
+                    policy[batch, text_token_start:,] = 1
+
+                total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
+                # merge and cluster
+                if s_flag and total_sparse_token_idx.shape[1]>0:
+
+                    total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
+                    total_sparse_token = batch_index_select(layer_outputs[0], total_sparse_token_idx) 
+                    
+                    merge_token_idx_stage1 = torch.where(pred_score_vis==0)[1]
+                    merge_token_stage1 = relation_vis_text[0][merge_token_idx_stage1]
+                    merge_token_num_stage1 = int(merge_token_idx_stage1.shape[0] * 0.3 ) + 1 # Top 30%
+                    merge_token_stage2_idx = merge_token_stage1.topk(merge_token_num_stage1)[1]
+                    
+                    merge_token_stage2 = total_sparse_token[:,merge_token_stage2_idx,:]
+                    cluster_num = int(merge_token_stage2.shape[1] / 10) + 1       
+                    if (cluster_num == 0) :
+                        cluster_num = merge_token_stage2.shape[1]
+                    
+                    merge_sparse_token = cluster_and_merge(merge_token_stage2, cluster_num)  
+
+                    select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
+                    select_token = batch_index_select(layer_outputs[0], select_token_idx)
+                    select_vis_token_num = pred_score_vis.sum()
+                    select_and_merge_token = torch.cat((select_token[:,:v_token_start+select_vis_token_num,:] ,
+                            merge_sparse_token,
+                            select_token[:,v_token_start+select_vis_token_num:,:])
+                            ,dim=1
+                    )
+
+                    layer_outputs = (select_and_merge_token, layer_outputs[1])  # B, L, C
+                    position_ids = position_ids[:, :len(select_token_idx[0])+cluster_num]
+                    prev_decision = policy
+                    # update
+                    v_token_num = pred_score_vis.sum() + cluster_num # B == 1
+                    # print(layer_idx, v_token_num)
+                    text_token_start = v_token_start + v_token_num
+                else:
+                    select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
+                    layer_outputs = (batch_index_select(layer_outputs[0], select_token_idx), layer_outputs[1])  # B, L, C
+                    position_ids = position_ids[:, :len(select_token_idx[0])]
+                    prev_decision = policy
+                    
+                    # update
+                    v_token_num = pred_score_vis.sum() # B == 1
+                    # print(layer_idx, v_token_num)
+                    text_token_start = v_token_start + v_token_num
+
+                idx_sprase_layer = idx_sprase_layer + 1 
+
+            # Normal Layers
+            else:
+
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    policy = policy,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                )
+
+            hidden_states = layer_outputs[0]
+            # num_token.append(v_token_num)
 
         # [Batch_Size, Seq_Len, Hidden_Size]
+
         hidden_states = self.norm(hidden_states)
+
+        # TIME
+        # if len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1:
+        #     total_end_event.record()
+        #     torch.cuda.synchronize()  
+        #     total_cuda_time_ms = total_start_event.elapsed_time(total_end_event)
+        #     self.total_cuda_time += total_cuda_time_ms
+        #     self.num_forward += 1
+        #     self.num_token_pool += (sum(num_token) / self.num_layers)
+        #     FLOPs_avg_sample = (self.all_FLOPs / self.num_forward) * 1e-12
+        #     print(f"equal token num until now: {self.num_token_pool / self.num_forward} ,total_layers_cuda_time:{self.total_cuda_time},TFLOPs_avg_sample:{FLOPs_avg_sample}")
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         return hidden_states
@@ -399,6 +720,9 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        image_shape=224,
+        pre_prompt_length_list=[],
+        retained_tokens=56,
     ) -> Tuple:
 
         # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
@@ -408,6 +732,9 @@ class GemmaForCausalLM(nn.Module):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            image_shape=image_shape,
+            pre_prompt_length_list=pre_prompt_length_list,
+            retained_tokens=retained_tokens,
         )
 
         hidden_states = outputs
@@ -524,6 +851,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        # image_shape=576,
+        pre_prompt_length_list=[],
+        retained_tokens=192,
     ) -> Tuple:
 
         # Make sure the input is right-padded
@@ -542,11 +872,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Merge the embeddings of the text tokens and the image tokens
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
         
+        image_shape = self.vision_tower.config.image_size
+
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            image_shape=image_shape,
+            pre_prompt_length_list=pre_prompt_length_list,
+            retained_tokens=retained_tokens,
         )
 
         return outputs
