@@ -265,6 +265,7 @@ class GemmaAttention(nn.Module):
 
         assert attention_mask is not None
         attn_weights = attn_weights + attention_mask
+        attn_logits = torch.softmax(attn_weights, dim=-1)
 
         # Apply the softmax
         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
@@ -286,7 +287,7 @@ class GemmaAttention(nn.Module):
         # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, kv_cache, attn_logits
 
 class GemmaDecoderLayer(nn.Module):
 
@@ -312,7 +313,7 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states, _, = self.self_attn(
+        hidden_states, self_attn_weights, present_kv_cache, relation_vis_text = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -330,15 +331,22 @@ class GemmaDecoderLayer(nn.Module):
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        outputs = (hidden_states,)
+
+        # outputs += (self_attn_weights,)
+
+        outputs += (present_kv_cache,)
+        outputs += (relation_vis_text, )  
+        return outputs
 
 class GemmaModel(nn.Module):
 
-    def __init__(self, config: GemmaConfig):
+    def __init__(self, config: GemmaConfig, pruning_loc = [2, 6, 15]):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.pruning_loc = pruning_loc
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -356,6 +364,8 @@ class GemmaModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        image_shape = 244,
+        retained_tokens = 56,
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
@@ -363,20 +373,166 @@ class GemmaModel(nn.Module):
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
-        for decoder_layer in self.layers:
-            # [Batch_Size, Seq_Len, Hidden_Size]
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                kv_cache=kv_cache,
-            )
+
+        # SPARSE LAYERS
+        B, L, _ = hidden_states.shape
+        # init_n = self.init_token_total_shape + self.generate_process_count
+        # policy = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+
+        v_token_start = 0 #assuming no pre tokens
+        t_token_start = v_token_start + image_shape
+        v_token_num = image_shape
+
+        if(hidden_states.shape[1] != 1):
+            v_t = hidden_states[:,v_token_start:t_token_start, :]
+            t_t = hidden_states[:, t_token_start:, :]
+            m_v_t = v_t @ t_t.transpose(1,2)
+            m_v_t = m_v_t.softmax(2).mean(1)
+            t_token_idx = torch.where(m_v_t > m_v_t.mean()) #here we have the text token raters
+
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if layer_idx in self.pruning_loc and hidden_states.shape[1] !=1:
+                print(f"Forward pass and pruning layer {layer_idx}")
+                print(f"Hidden state shape before = {hidden_states.shape}")
+                print(f"Attention mask shape before = {attention_mask.shape}")
+                # [Batch_Size, Seq_Len, Hidden_Size]
+                output_layer = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                )
+
+                attn_logits = output_layer[2]
+
+                pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, retained_tokens) # B, L_v
+                policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+                policy[:, v_token_start:t_token_start] = pred_score_vis.type(dtype = hidden_states.dtype)
+
+                # total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
+
+                select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
+                output_layer = (batch_index_select(output_layer[0], select_token_idx), output_layer[1])  # B, L, C
+                position_ids = position_ids[:, :len(select_token_idx[0])]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, :, select_token_idx[0], :][:, :, :, select_token_idx[0]]
+                # prev_decision = policy
+
+                # if attention_mask is not None:
+                #     # select_token_idx: [1, L_new]
+                #     idx = select_token_idx[0]  # [L_new]
+
+                #     # keep only rows and columns for the kept tokens
+                #     # attention_mask: [B, 1, L, L] -> [B, 1, L_new, L_new]
+                #     attention_mask = attention_mask[:, :, idx, :]        # [B, 1, L_new, L]
+                #     attention_mask = attention_mask[:, :, :, idx]        # [B, 1, L_new, L_new]
+                
+                # update
+                v_token_num = pred_score_vis.sum() # B == 1
+                # print(layer_idx, v_token_num)
+                t_token_start = v_token_start + v_token_num
+                print(f"Output layer shape after = {output_layer[0].shape}")
+                print(f"Attention mask shape after = {attention_mask.shape}")
+                
+            else:
+                print(f"Forward pass on layer {layer_idx}")
+                print(f"Hidden state shape before = {hidden_states.shape}")
+                print(f"Attention mask shape before = {attention_mask.shape}")
+                # [Batch_Size, Seq_Len, Hidden_Size]
+                output_layer = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                )
+                print(f"Output layer shape  = {output_layer[0].shape}")
+                print(f"Attention mask shape = {attention_mask.shape}")
+
+            hidden_states = output_layer[0]
+
+            # next_decoder_cache = output_layer[1]
+
+
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.norm(hidden_states)
+        # next_cache = next_decoder_cache
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         return hidden_states
+
+
+
+layer_dict = {2:0,6:1,15:2}     # 
+
+sparse_token_list_192 = [300,200,110]       # 2*576  4*300 10*200  16*110
+sparse_token_list_128 = [303,110,36]
+sparse_token_list_64 = [66,30,17]     
+sparse_token_list_56 = [100, 75, 50]     
+
+sparse_token_dict = {
+    192: sparse_token_list_192,
+    128: sparse_token_list_128,
+    56 : sparse_token_list_56
+}
+
+
+def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, retained_tokens):
+    '''
+    self_attn_weights: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+    '''
+    self_attn_weights = self_attn_weights.mean(1) # Batch_Size, Seq_Len_Q, Seq_Len_KV]
+
+    t_token_idx = t_token_idx[1] + t_token_start
+    relation_vis_text = self_attn_weights[:, t_token_idx , v_token_start: v_token_start+v_token_num] # B, L2, L1
+
+    relation_vis_text = relation_vis_text.mean(1) # B, L1
+
+    relation_vis = relation_vis_text
+    s_flag = True       # s_flag controls whether token merge is needed.
+
+    sparse_token_list = sparse_token_dict[retained_tokens]
+
+    if v_token_num != 0:
+        mask = torch.zeros_like(relation_vis, dtype=bool)
+        _, indices = torch.topk(relation_vis, min(sparse_token_list[layer_dict[layer_idx]], v_token_num - 1), dim=1)
+        mask[0][indices] = 1
+    else:
+        mask = torch.ones_like(relation_vis_text, dtype=bool)
+        s_flag = False
+    return mask, s_flag, relation_vis_text
+
+
+def  batch_index_select(x, idx):
+
+    if len(x.size()) == 4:
+        B, H, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, H, C)[idx.reshape(-1)].reshape(B, H, N_new, C)
+        return out
+    elif len(x.size()) == 3:
+        # in this condition
+        B, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
+        return out
+    elif len(x.size()) == 2:
+        B, N = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N)[idx.reshape(-1)].reshape(B, N_new)
+        return out
+    else:
+        raise NotImplementedError
+
+
+
 
 class GemmaForCausalLM(nn.Module):
 
@@ -399,6 +555,7 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        image_shape = 244,
     ) -> Tuple:
 
         # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
@@ -408,6 +565,7 @@ class GemmaForCausalLM(nn.Module):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            image_shape = image_shape,
         )
 
         hidden_states = outputs
@@ -541,12 +699,15 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         # Merge the embeddings of the text tokens and the image tokens
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
+
+        image_shape = self.vision_tower.config.image_size
         
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            image_shape = image_shape,
         )
 
         return outputs

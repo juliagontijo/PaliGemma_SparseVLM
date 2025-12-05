@@ -145,4 +145,49 @@ def main(
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    # fire.Fire(main)
+    # import argparse
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--model_path", type=str, required=True)
+    # parser.add_argument("--prompt", type=str, required=True)
+    # parser.add_argument("--image_file_path", type=str, required=True)
+    # parser.add_argument("--max_tokens_to_generate", type=int, default=100)
+    # parser.add_argument("--temperature", type=float, default=0.8)
+    # parser.add_argument("--top_p", type=float, default=0.9)
+    # parser.add_argument("--do_sample", type=lambda x: x.lower() == 'true', default=False)
+    # parser.add_argument("--only_cpu", type=lambda x: x.lower() == 'true', default=False)
+    
+    # args = parser.parse_args()
+    
+    # main(
+    #     model_path=args.model_path,
+    #     prompt=args.prompt,
+    #     image_file_path=args.image_file_path,
+    #     max_tokens_to_generate=args.max_tokens_to_generate,
+    #     temperature=args.temperature,
+    #     top_p=args.top_p,
+    #     do_sample=args.do_sample,
+    #     only_cpu=args.only_cpu
+    # )
+
+    HOME = "/Users/juliagontijolopes"
+
+    model_path = f"{HOME}/Desktop/PaliGemma/paligemma-weights/paligemma-3b-pt-224"
+    prompt = "'this is a picture of '"
+    image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+    max_tokens_to_generate = 200
+    temperature = 0.8
+    top_p = 0.9
+    do_sample=False
+    only_cpu = False
+
+    main(
+        model_path=model_path,
+        prompt=prompt,
+        image_file_path=image_file_path,
+        max_tokens_to_generate=max_tokens_to_generate,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=do_sample,
+        only_cpu=only_cpu
+    )
