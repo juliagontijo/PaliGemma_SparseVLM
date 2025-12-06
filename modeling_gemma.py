@@ -17,6 +17,13 @@ class KVCache():
         else:
             # The shape of the key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
             return self.key_cache[0].shape[-2]
+        
+    def num_items_bylayer(self, layer_idx) -> int:
+        if len(self.key_cache) == 0:
+            return 0
+        else:
+            # The shape of the key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+            return self.key_cache[layer_idx].shape[-2]
 
     def update(
         self,
@@ -249,6 +256,11 @@ class GemmaAttention(nn.Module):
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # if len(position_ids[0]) == 1:
+            # position_ids = torch.tensor([[kv_cache.get_usable_length(kv_seq_len, self.layer_idx)]], dtype=torch.int64).cuda()
+        # if kv_cache is not None:
+            # kv_seq_len += kv_cache.get_usable_length(kv_seq_len, self.layer_idx)
+
         # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
@@ -264,7 +276,9 @@ class GemmaAttention(nn.Module):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         assert attention_mask is not None
-        attn_weights = attn_weights + attention_mask
+
+        # FIX ATTENTION LENGTH MISMATCH WITH SEQ LENGTH -> NOT AN ISSUE FOR NOW BECAUSE PALIGEMMA DELIBERATELY DOES NOT APPLY CAUSAL MASK ON INPUT
+        # attn_weights = attn_weights + attention_mask
         attn_logits = torch.softmax(attn_weights, dim=-1)
 
         # Apply the softmax
