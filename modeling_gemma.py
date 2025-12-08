@@ -381,6 +381,7 @@ class GemmaModel(nn.Module):
         image_shape = 244,
         retained_tokens = 56,
     ) -> torch.FloatTensor:
+        # debug = {"layer": [], "L": [], "v_tokens": [], "t_tokens": []}
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
         # [Batch_Size, Seq_Len, Hidden_Size]
@@ -407,9 +408,14 @@ class GemmaModel(nn.Module):
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if layer_idx in self.pruning_loc and hidden_states.shape[1] !=1:
-                print(f"Forward pass and pruning layer {layer_idx}")
-                print(f"Hidden state shape before = {hidden_states.shape}")
-                print(f"Attention mask shape before = {attention_mask.shape}")
+                
+                print(f"\\nn######## Forward pass and pruning layer {layer_idx} ########")
+                print("\n-- BEFORE --")
+                print(f"Hidden state shape = {hidden_states.shape}")
+                print(f"Num of visual tokens = {v_token_num}")
+                print(f"Num of text tokens = {hidden_states.shape[1] - v_token_num}")
+                print(f"Attention mask shape = {attention_mask.shape}\n")
+
                 # [Batch_Size, Seq_Len, Hidden_Size]
                 output_layer = decoder_layer(
                     hidden_states,
@@ -422,35 +428,67 @@ class GemmaModel(nn.Module):
 
                 pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, retained_tokens) # B, L_v
                 policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
-                policy[:, v_token_start:t_token_start] = pred_score_vis.type(dtype = hidden_states.dtype)
+                policy[:, v_token_start:t_token_start] = pred_score_vis.type(dtype = hidden_states.dtype) 
+
+
+                # #### TESTE BEGGINNING
+
+                # expected_keep = sparse_token_dict[retained_tokens][layer_dict[layer_idx]]
+                # actual_keep = int(pred_score_vis.sum().item())
+                # print(f"Layer {layer_idx}: expected ≈{expected_keep}, actual {actual_keep}")
+
+                # # update
+                # v_token_num = pred_score_vis.sum()       # visual tokens kept
+                # num_text_tokens = hidden_states.shape[1] - v_token_num  # before overwriting hidden_states
+
+                # L_new = output_layer[0].shape[1]
+                # assert L_new == num_text_tokens + v_token_num, "Inconsistent pruning: L_new != vis + text"
+
+                # #### TESTS ENDING 
+
+
 
                 # total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
 
                 select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
                 output_layer = (batch_index_select(output_layer[0], select_token_idx), output_layer[1])  # B, L, C
+
+                # #### TESTE BEGGINNING
+
+                # L_new = output_layer[0].shape[1]
+                # num_text_tokens = L - v_token_num        # before pruning
+                # num_vis_tokens_new = int(pred_score_vis.sum())
+
+                # assert L_new == num_text_tokens + num_vis_tokens_new
+
+                # #### TESTE ENDING
+
+
                 position_ids = position_ids[:, :len(select_token_idx[0])]
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, :, select_token_idx[0], :][:, :, :, select_token_idx[0]]
                 # prev_decision = policy
 
-                # if attention_mask is not None:
-                #     # select_token_idx: [1, L_new]
-                #     idx = select_token_idx[0]  # [L_new]
-
-                #     # keep only rows and columns for the kept tokens
-                #     # attention_mask: [B, 1, L, L] -> [B, 1, L_new, L_new]
-                #     attention_mask = attention_mask[:, :, idx, :]        # [B, 1, L_new, L]
-                #     attention_mask = attention_mask[:, :, :, idx]        # [B, 1, L_new, L_new]
                 
                 # update
                 v_token_num = pred_score_vis.sum() # B == 1
                 # print(layer_idx, v_token_num)
                 t_token_start = v_token_start + v_token_num
-                print(f"Output layer shape after = {output_layer[0].shape}")
-                print(f"Attention mask shape after = {attention_mask.shape}")
+
+
+                #### TESTS BEGINNIG ####
+
+                # assert torch.all(policy[:, t_token_start:] == 1), "Text tokens got pruned!"
+
+
+                print("\n-- AFTER --")
+                print(f"Hidden state shape = {output_layer[0].shape}")
+                print(f"Num of visual tokens = {v_token_num}")
+                print(f"Num of text tokens = {output_layer[0].shape[1] - v_token_num}")
+                print(f"Attention mask shape = {attention_mask.shape}\n")
                 
             else:
-                print(f"Forward pass on layer {layer_idx}")
+                print(f"\\nn######## Normal forward pass layer {layer_idx} ########")
                 print(f"Hidden state shape before = {hidden_states.shape}")
                 print(f"Attention mask shape before = {attention_mask.shape}")
                 # [Batch_Size, Seq_Len, Hidden_Size]

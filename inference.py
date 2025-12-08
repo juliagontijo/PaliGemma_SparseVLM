@@ -16,6 +16,7 @@ def get_model_inputs(
     processor: PaliGemmaProcessor, prompt: str, image_file_path: str, device: str
 ):
     image = Image.open(image_file_path)
+    image = image.convert("RGB")
     images = [image]
     prompts = [prompt]
     model_inputs = processor(text=prompts, images=images)
@@ -173,8 +174,11 @@ if __name__ == "__main__":
     HOME = "/Users/juliagontijolopes"
 
     model_path = f"{HOME}/Desktop/PaliGemma/paligemma-weights/paligemma-3b-pt-224"
-    prompt = "'this is a picture of '"
-    image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+    prompt = "'What is the cat on top of '"
+     
+    image_file_path = f"{HOME}/Desktop/PaliGemma/images/blackcat.png"
+    # image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+
     max_tokens_to_generate = 200
     temperature = 0.8
     top_p = 0.9
