@@ -191,11 +191,77 @@ if __name__ == "__main__":
     HOME = "/Users/juliagontijolopes"
 
     model_path = f"{HOME}/Desktop/PaliGemma/paligemma-weights/paligemma-3b-pt-224"
-    prompt = "'What is this monument called '"
-    expected_answer = "'christ redeemer'"
-     
-    # image_file_path = f"{HOME}/Desktop/PaliGemma/images/blackcat.png"
-    image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+    
+    dataset = {
+        1: {
+            "prompt": "'What is this monument called '",
+            "expected_answer": "'christ redeemer'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+        },
+        2: {
+            "prompt": "'What is on top of the blanket? '",
+            "expected_answer": "'black cat'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/blackcat.png"
+        },
+        3: {
+            "prompt": "'What are they doing? '",
+            "expected_answer": "'playing frisbee'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image110.jpg"
+        },
+        4: {
+            "prompt": "'What are the people in the image doing? '",
+            "expected_answer": "'playing soccer'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image54.jpg"
+        },
+        5: {
+            "prompt": "'What is on the image? '",
+            "expected_answer": "'cat'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image79.jpg"
+        },
+        6: {
+            "prompt": "'What is the person wearing? '",
+            "expected_answer": "'scarf'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image81.jpg"
+        },
+        7: {
+            "prompt": "'What is on the background? '",
+            "expected_answer": "'snow'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image8.jpg"
+        },
+        8: {
+            "prompt": "'What is the person doing? '",
+            "expected_answer": "'on phone'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image5.jpg"
+        },
+        9: {
+            "prompt": "'What is the cat doing? '",
+            "expected_answer": "'sleeping'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image10000.jpg"
+        },
+        10: {
+            "prompt": "'What is the bear doing? '",
+            "expected_answer": "'relaxing'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image0.jpg"
+        },
+        11: {
+            "prompt": "'What is the she doing? '",
+            "expected_answer": "'reading'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image98.jpg"
+        },
+        12: {
+            "prompt": "'Is this a bedroom? '",
+            "expected_answer": "'yes'",
+            "image_file_path": f"{HOME}/Desktop/PaliGemma/images/image553.jpg"
+        }
+
+    }
+
+    img_idx = 4
+    print(f"# Exp image {img_idx}\n")
+
+    prompt = dataset[img_idx]["prompt"]
+    expected_answer = dataset[img_idx]["expected_answer"]
+    image_file_path = dataset[img_idx]["image_file_path"]
 
     max_tokens_to_generate = 100
     temperature = 0.8
