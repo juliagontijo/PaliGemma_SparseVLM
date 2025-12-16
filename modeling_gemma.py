@@ -4,6 +4,7 @@ from typing import Optional, Tuple, List
 from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
+import time
 
 class KVCache():
 
@@ -378,8 +379,10 @@ class GemmaModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        image_shape = 244,
+        image_num_tokens = 265,
         retained_tokens = 56,
+        layers_to_prune = [],
+        ratios = [],
     ) -> torch.FloatTensor:
         # debug = {"layer": [], "L": [], "v_tokens": [], "t_tokens": []}
         # [Batch_Size, Seq_Len, Hidden_Size]
@@ -395,8 +398,9 @@ class GemmaModel(nn.Module):
         # policy = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
 
         v_token_start = 0 #assuming no pre tokens
-        t_token_start = v_token_start + image_shape
-        v_token_num = image_shape
+        t_token_start = v_token_start + image_num_tokens
+        v_token_num = image_num_tokens
+        original_v_token_num = v_token_num
 
         if(hidden_states.shape[1] != 1):
             v_t = hidden_states[:,v_token_start:t_token_start, :]
@@ -405,16 +409,22 @@ class GemmaModel(nn.Module):
             m_v_t = m_v_t.softmax(2).mean(1)
             t_token_idx = torch.where(m_v_t > m_v_t.mean()) #here we have the text token raters
 
+        total_attn_flops = 0.0
+
+        start = time.perf_counter()
 
         for layer_idx, decoder_layer in enumerate(self.layers):
-            if layer_idx in self.pruning_loc and hidden_states.shape[1] !=1:
+            if layer_idx in layers_to_prune and hidden_states.shape[1] !=1:
                 
-                print(f"\\nn######## Forward pass and pruning layer {layer_idx} ########")
+                print(f"\n\n##### Prunning layer {layer_idx} with {ratios[layer_idx]} ratio of tokens to keep")
+                print(f"\n\n##### Prefill forward pass - dim changes")
                 print("\n-- BEFORE --")
                 print(f"Hidden state shape = {hidden_states.shape}")
                 print(f"Num of visual tokens = {v_token_num}")
                 print(f"Num of text tokens = {hidden_states.shape[1] - v_token_num}")
-                print(f"Attention mask shape = {attention_mask.shape}\n")
+                print(f"Attention mask shape = {attention_mask.shape}")
+                if layer_idx != 1:
+                    print(f"KV Cache shape = {output_layer[1].key_cache[-1].shape}")
 
                 # [Batch_Size, Seq_Len, Hidden_Size]
                 output_layer = decoder_layer(
@@ -426,71 +436,37 @@ class GemmaModel(nn.Module):
 
                 attn_logits = output_layer[2]
 
-                pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, retained_tokens) # B, L_v
+                pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, layers_to_prune, ratios, original_v_token_num) # B, L_v
                 policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
                 policy[:, v_token_start:t_token_start] = pred_score_vis.type(dtype = hidden_states.dtype) 
 
-
-                # #### TESTE BEGGINNING
-
-                # expected_keep = sparse_token_dict[retained_tokens][layer_dict[layer_idx]]
-                # actual_keep = int(pred_score_vis.sum().item())
-                # print(f"Layer {layer_idx}: expected ≈{expected_keep}, actual {actual_keep}")
-
-                # # update
-                # v_token_num = pred_score_vis.sum()       # visual tokens kept
-                # num_text_tokens = hidden_states.shape[1] - v_token_num  # before overwriting hidden_states
-
-                # L_new = output_layer[0].shape[1]
-                # assert L_new == num_text_tokens + v_token_num, "Inconsistent pruning: L_new != vis + text"
-
-                # #### TESTS ENDING 
-
-
-
-                # total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
-
                 select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
                 output_layer = (batch_index_select(output_layer[0], select_token_idx), output_layer[1])  # B, L, C
-
-                # #### TESTE BEGGINNING
-
-                # L_new = output_layer[0].shape[1]
-                # num_text_tokens = L - v_token_num        # before pruning
-                # num_vis_tokens_new = int(pred_score_vis.sum())
-
-                # assert L_new == num_text_tokens + num_vis_tokens_new
-
-                # #### TESTE ENDING
-
 
                 position_ids = position_ids[:, :len(select_token_idx[0])]
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, :, select_token_idx[0], :][:, :, :, select_token_idx[0]]
                 # prev_decision = policy
 
-                
                 # update
                 v_token_num = pred_score_vis.sum() # B == 1
                 # print(layer_idx, v_token_num)
                 t_token_start = v_token_start + v_token_num
 
 
-                #### TESTS BEGINNIG ####
-
-                # assert torch.all(policy[:, t_token_start:] == 1), "Text tokens got pruned!"
-
-
                 print("\n-- AFTER --")
                 print(f"Hidden state shape = {output_layer[0].shape}")
                 print(f"Num of visual tokens = {v_token_num}")
-                print(f"Num of text tokens = {output_layer[0].shape[1] - v_token_num}")
-                print(f"Attention mask shape = {attention_mask.shape}\n")
+                print(f"Num of text tokens = {output_layer[0].shape[1] - (v_token_num)}")
+                print(f"Attention mask shape = {attention_mask.shape}")
+                print(f"KV Cache shape = {output_layer[1].key_cache[-1].shape}\n")
+
+                print(f"##### Time and FLOPS\n")
                 
             else:
-                print(f"\\nn######## Normal forward pass layer {layer_idx} ########")
-                print(f"Hidden state shape before = {hidden_states.shape}")
-                print(f"Attention mask shape before = {attention_mask.shape}")
+                # print(f"\\nn######## Normal forward pass layer {layer_idx} ########")
+                # print(f"Hidden state shape before = {hidden_states.shape}")
+                # print(f"Attention mask shape before = {attention_mask.shape}")
                 # [Batch_Size, Seq_Len, Hidden_Size]
                 output_layer = decoder_layer(
                     hidden_states,
@@ -498,14 +474,37 @@ class GemmaModel(nn.Module):
                     position_ids=position_ids,
                     kv_cache=kv_cache,
                 )
-                print(f"Output layer shape  = {output_layer[0].shape}")
-                print(f"Attention mask shape = {attention_mask.shape}")
+                # print(f"Output layer shape  = {output_layer[0].shape}")
+                # print(f"Attention mask shape = {attention_mask.shape}")
+                # print(f"KV Cache shape = {output_layer[1].key_cache[-1].shape}\n")
 
             hidden_states = output_layer[0]
 
             # next_decoder_cache = output_layer[1]
 
+            B = hidden_states.size(0)
+            Tq = hidden_states.size(1)
+            d_model = self.config.hidden_size
+            n_heads = self.config.num_attention_heads
+            d_head = d_model // n_heads
 
+            if kv_cache is not None and kv_cache.num_items() > 0 and Tq == 1:
+                Tk = kv_cache.num_items() + 1
+            else:
+                Tk = Tq
+
+            # three projections (Q,K,V) + output projection
+            flops_proj  = 6.0 * B * Tq * (d_model ** 2)
+            # QK and PV matmuls
+            flops_attn  = 4.0 * B * n_heads * Tq * Tk * d_head
+
+            total_attn_flops += flops_proj + flops_attn
+
+
+        end = time.perf_counter() 
+        # After the loop (at the end of forward), add:
+        print(f"Attention FLOPs for this call: {total_attn_flops / 1e9:.3f} GFLOPs")
+        print(f"Elapsed time: {end - start:.6f} seconds")
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.norm(hidden_states)
@@ -530,10 +529,13 @@ sparse_token_dict = {
 }
 
 
-def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, retained_tokens):
+def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, t_token_start, t_token_idx, layer_idx, layers_to_prune, ratios, original_v_token_num):
     '''
     self_attn_weights: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
     '''
+
+    assert (layer_idx in layers_to_prune and layer_idx in ratios), f"Key {layer_idx} not found in dict"
+
     self_attn_weights = self_attn_weights.mean(1) # Batch_Size, Seq_Len_Q, Seq_Len_KV]
 
     t_token_idx = t_token_idx[1] + t_token_start
@@ -544,11 +546,13 @@ def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, t_token
     relation_vis = relation_vis_text
     s_flag = True       # s_flag controls whether token merge is needed.
 
-    sparse_token_list = sparse_token_dict[retained_tokens]
+    # sparse_token_list = sparse_token_dict[retained_tokens]
+
+    ratio_token_to_keep = int(original_v_token_num * ratios[layer_idx])
 
     if v_token_num != 0:
         mask = torch.zeros_like(relation_vis, dtype=bool)
-        _, indices = torch.topk(relation_vis, min(sparse_token_list[layer_dict[layer_idx]], v_token_num - 1), dim=1)
+        _, indices = torch.topk(relation_vis, min(ratio_token_to_keep, v_token_num - 1), dim=1)
         mask[0][indices] = 1
     else:
         mask = torch.ones_like(relation_vis_text, dtype=bool)
@@ -607,7 +611,9 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        image_shape = 244,
+        image_num_tokens = 265,
+        layers_to_prune = [],
+        ratios = [],
     ) -> Tuple:
 
         # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
@@ -617,7 +623,9 @@ class GemmaForCausalLM(nn.Module):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
-            image_shape = image_shape,
+            image_num_tokens = image_num_tokens,
+            layers_to_prune = layers_to_prune,
+            ratios = ratios
         )
 
         hidden_states = outputs
@@ -734,6 +742,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        layers_to_prune = [],
+        ratios = [],
     ) -> Tuple:
 
         # Make sure the input is right-padded
@@ -752,14 +762,17 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Merge the embeddings of the text tokens and the image tokens
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
 
-        image_shape = self.vision_tower.config.image_size
+        # image_shape = self.vision_tower.config.image_size
+        image_num_tokens = selected_image_feature.shape[1]
         
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
-            image_shape = image_shape,
+            image_num_tokens = image_num_tokens,
+            layers_to_prune = layers_to_prune,
+            ratios=ratios,
         )
 
         return outputs

@@ -34,8 +34,12 @@ def test_inference(
     temperature: float,
     top_p: float,
     do_sample: bool,
+    layers_to_prune,
+    ratios,
+    expected_answer: str,
 ):
     model_inputs = get_model_inputs(processor, prompt, image_file_path, device)
+
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
     pixel_values = model_inputs["pixel_values"]
@@ -46,6 +50,9 @@ def test_inference(
     stop_token = processor.tokenizer.eos_token_id
     generated_tokens = []
 
+    print(f"\n########## - SPARSEVLM IMPLEMENTATION - ##########\n\nImage: {image_file_path}\n")
+
+    print(f"### Pruning Layers: {layers_to_prune} - Ratios of tokens to keep: {ratios}")
     for _ in range(max_tokens_to_generate):
         # Get the model outputs
         # TODO: remove the labels
@@ -54,6 +61,8 @@ def test_inference(
             pixel_values=pixel_values,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
+            layers_to_prune=layers_to_prune,
+            ratios=ratios,
         )
         kv_cache = outputs["kv_cache"]
         next_token_logits = outputs["logits"][:, -1, :]
@@ -80,7 +89,9 @@ def test_inference(
     # Decode the generated tokens
     decoded = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
+    print(f"\n##### Expected answer: {expected_answer}")
     print(prompt + decoded)
+    print("\n----------------------------------------------------------------\n")
 
 
 def _sample_top_p(probs: torch.Tensor, p: float):
@@ -111,6 +122,9 @@ def main(
     top_p: float = 0.9,
     do_sample: bool = False,
     only_cpu: bool = False,
+    layers_to_prune = [],
+    ratios = [],
+    expected_answer: str = None,
 ):
     device = "cpu"
 
@@ -142,6 +156,9 @@ def main(
             temperature,
             top_p,
             do_sample,
+            layers_to_prune,
+            ratios,
+            expected_answer,
         )
 
 
@@ -174,16 +191,24 @@ if __name__ == "__main__":
     HOME = "/Users/juliagontijolopes"
 
     model_path = f"{HOME}/Desktop/PaliGemma/paligemma-weights/paligemma-3b-pt-224"
-    prompt = "'What is the cat on top of '"
+    prompt = "'What is this monument called '"
+    expected_answer = "'christ redeemer'"
      
-    image_file_path = f"{HOME}/Desktop/PaliGemma/images/blackcat.png"
-    # image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
+    # image_file_path = f"{HOME}/Desktop/PaliGemma/images/blackcat.png"
+    image_file_path = f"{HOME}/Desktop/PaliGemma/images/christ.jpg"
 
-    max_tokens_to_generate = 200
+    max_tokens_to_generate = 100
     temperature = 0.8
     top_p = 0.9
     do_sample=False
     only_cpu = False
+
+    layers_to_prune = [15, 16, 17] # layers to prune on prefill (next layers will also have pruned kvcache)
+    ratios = { 
+        15: 0.7,
+        16: 0.5,
+        17: 0.2
+        } # ratio of tokens to keep
 
     main(
         model_path=model_path,
@@ -193,5 +218,8 @@ if __name__ == "__main__":
         temperature=temperature,
         top_p=top_p,
         do_sample=do_sample,
-        only_cpu=only_cpu
+        only_cpu=only_cpu,
+        layers_to_prune=layers_to_prune,
+        ratios=ratios,
+        expected_answer=expected_answer,
     )
